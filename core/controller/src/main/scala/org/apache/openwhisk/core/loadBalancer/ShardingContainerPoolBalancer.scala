@@ -260,20 +260,32 @@ class ShardingContainerPoolBalancer(
     val (invokersToUse, stepSizes) =
       if (!isBlackboxInvocation) (schedulingState.managedInvokers, schedulingState.managedStepSizes)
       else (schedulingState.blackboxInvokers, schedulingState.blackboxStepSizes)
+    var spreadInvokers: Option[List[InvokerInstanceId]] = None
+
+    logging.info(
+      this,
+      s"Action name is ${action.fullyQualifiedName(true).name.toString()}"
+    )
+
+    val willSpread: Boolean = action.fullyQualifiedName(true).name.toString().startsWith("SPREAD_")
+
     val chosen = if (invokersToUse.nonEmpty) {
       val hash = ShardingContainerPoolBalancer.generateHash(msg.user.namespace.name, action.fullyQualifiedName(false))
       val homeInvoker = hash % invokersToUse.size
+      val homeInvokerId = invokersToUse(homeInvoker)
       val stepSize = stepSizes(hash % stepSizes.size)
-      val invoker: Option[(InvokerInstanceId, Boolean)] = ShardingContainerPoolBalancer.schedule(
+      val invokers: Option[(InvokerInstanceId, Boolean,List[InvokerInstanceId])] = ShardingContainerPoolBalancer.ScheduleAndSpread(
         action.limits.concurrency.maxConcurrent,
         action.fullyQualifiedName(true),
         invokersToUse,
         schedulingState.invokerSlots,
         action.limits.memory.megabytes,
         homeInvoker,
-        stepSize)
-      invoker.foreach {
-        case (_, true) =>
+        stepSize,
+        willSpread)
+
+      invokers.foreach {
+        case (_, true, _) =>
           val metric =
             if (isBlackboxInvocation)
               LoggingMarkers.BLACKBOX_SYSTEM_OVERLOAD
@@ -282,10 +294,39 @@ class ShardingContainerPoolBalancer(
           MetricEmitter.emitCounterMetric(metric)
         case _ =>
       }
-      invoker.map(_._1)
+      spreadInvokers = invokers.map(_._3)
+      invokers.map(_._1)
     } else {
       None
     }
+
+    val numInvokersSpread: Int = spreadInvokers match {
+      case Some(list) => list.size
+      case None => 0
+    }
+    logging.info(
+      this,
+      s"Going to scheduler to ${chosen} and ${spreadInvokers} invokers for a total extra invokers of ${numInvokersSpread}"
+    )
+    spreadInvokers
+      .map { invokerList =>
+        invokerList
+          .map { invoker =>
+            // MemoryLimit() and TimeLimit() return singletons - they should be fast enough to be used here
+            val memoryLimit = action.limits.memory
+            val memoryLimitInfo = if (memoryLimit == MemoryLimit()) "std" else "non-std"
+            val timeLimit = action.limits.timeout
+            val timeLimitInfo = if (timeLimit == TimeLimit()) "std" else "non-std"
+
+            logging.info(
+              this,
+              s"scheduled spreadInvokers ${invoker}, activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to $invoker"
+            )
+
+            val activationResult = setupActivation(msg, action, invoker)
+            sendActivationToInvoker(messageProducer, msg, invoker).map(_ => activationResult)
+          }
+      }
 
     chosen
       .map { invoker =>
@@ -296,7 +337,7 @@ class ShardingContainerPoolBalancer(
         val timeLimitInfo = if (timeLimit == TimeLimit()) { "std" } else { "non-std" }
         logging.info(
           this,
-          s"scheduled activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to ${invoker}")
+          s"scheduled chosen ${chosen}, activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to ${invoker}")
         val activationResult = setupActivation(msg, action, invoker)
         sendActivationToInvoker(messageProducer, msg, invoker).map(_ => activationResult)
       }
@@ -433,6 +474,119 @@ object ShardingContainerPoolBalancer extends LoadBalancerProvider {
     } else {
       None
     }
+  }
+  /**
+   * Scans through all invokers and searches for an invoker tries to get a free slot on all invokers. Returns all possible invokers to be spread to (excluding the chosen invoker)
+   *
+   * @param maxConcurrent concurrency limit supported by this action
+   * @param invokers a list of available invokers to search in, including their state
+   * @param dispatched semaphores for each invoker to give the slots away from
+   * @param slots Number of slots, that need to be acquired (e.g. memory in MB)
+   * @param index the index to start from (initially should be the "homeInvoker"
+   * @param step stable identifier of the entity to be scheduled
+   * @param finalList tail recurse list to be returnt
+   * @return a list of invokers to be scheduled, None if no invokers available; second argument true if system is overloaded false if not
+   */
+  @tailrec
+  def ScheduleAndSpread(
+    maxConcurrent: Int,
+    fqn: FullyQualifiedEntityName,
+    invokers: IndexedSeq[InvokerHealth],
+    dispatched: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]],
+    slots: Int,
+    index: Int,
+    step: Int,
+    willSpread: Boolean,
+    stepsDone: Int = 0,
+    finalList: List[InvokerInstanceId] = Nil,
+    chosenInvoker: Int = -1)(implicit logging: Logging, transId: TransactionId): Option[(InvokerInstanceId, Boolean, List[InvokerInstanceId])] = {
+    val numInvokers = invokers.size
+
+
+    val invoker = invokers(index)
+    //test this invoker - if this action supports concurrency, use the scheduleConcurrent function
+    //if (invoker.status.isUsable && dispatched(invoker.id.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots) && homeInvoker != index) {
+
+    // If we've gone through all invokers
+    if (stepsDone == numInvokers) {
+      if (chosenInvoker == -1){
+        val healthyInvokers = invokers.filter(_.status.isUsable)
+        if (healthyInvokers.nonEmpty) {
+          // Choose a healthy invoker randomly
+          val random = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
+          dispatched(random.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
+          logging.warn(this, s"systems are overloaded. Chose invoker${random.toInt} by random assignment.")
+          Some(random, true, finalList)
+        } else {
+          None
+        }
+      } else {
+        logging.info(this, s"chosenInvoker $chosenInvoker not saturated and found invokers, invokers to to give actions to ${finalList.reverse}, first is primary rest are spread, on step $stepsDone")
+        //Some(invokers(chosenInvoker).id, false, finalList.reverse)
+        Some(invokers(chosenInvoker).id, false, finalList.reverse)
+      }
+
+    } else {
+      if (invoker.status.isUsable && dispatched(invoker.id.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots)) {
+        val newIndex = (index + step) % numInvokers
+        if (chosenInvoker == -1) {
+          logging.info(this, s"found first invoker ${invoker.id}, on step $stepsDone")
+          if (willSpread) {
+            ScheduleAndSpread(maxConcurrent, fqn, invokers, dispatched, slots, newIndex, step, willSpread, stepsDone + 1, finalList, invoker.id.toInt)
+          } else {
+            Some(invoker.id, false, finalList.reverse)
+          }
+        } else {
+          logging.info(this, s"found additional invokers ${invoker.id}, on step $stepsDone")
+          ScheduleAndSpread(maxConcurrent, fqn, invokers, dispatched, slots, newIndex, step, willSpread, stepsDone + 1, invoker.id :: finalList, chosenInvoker)
+        }
+      } else {
+        logging.info(this, s"invoker ${invoker.id} is saturated going to next invoker number of invokers $numInvokers, on step $stepsDone")
+        val newIndex = (index + step) % numInvokers
+        ScheduleAndSpread(maxConcurrent, fqn, invokers, dispatched, slots, newIndex, step, willSpread, stepsDone + 1, finalList, chosenInvoker)
+      }
+    }
+
+
+
+
+    // val invoker = invokers(index)
+    // //test this invoker - if this action supports concurrency, use the scheduleConcurrent function
+    // //if (invoker.status.isUsable && dispatched(invoker.id.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots) && homeInvoker != index) {
+    // if (invoker.status.isUsable && dispatched(invoker.id.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots)) {
+    //   val newIndex = (index + step) % numInvokers
+    //   if (chosenInvoker == -1) {
+    //     logging.info(this, s"found first invoker ${invoker.id}, on step $stepsDone")
+    //     ScheduleAndSpread(maxConcurrent, fqn, invokers, dispatched, slots, newIndex, step, homeInvoker, stepsDone + 1, finalList, invoker.id.toInt)
+    //   } else {
+    //     logging.info(this, s"found additional invokers ${invoker.id}, on step $stepsDone")
+    //     ScheduleAndSpread(maxConcurrent, fqn, invokers, dispatched, slots, newIndex, step, homeInvoker, stepsDone + 1, invoker.id :: finalList, chosenInvoker)
+    //   }
+    // } else {
+    //   // If we've gone through all invokers
+    //   if (stepsDone == numInvokers + 1) { 
+    //     if (finalList == Nil){
+    //       val healthyInvokers = invokers.filter(_.status.isUsable)
+    //       if (healthyInvokers.nonEmpty) {
+    //         // Choose a healthy invoker randomly
+    //         val random = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
+    //         dispatched(random.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
+    //         logging.warn(this, s"systems are overloaded. Chose invoker${random.toInt} by random assignment.")
+    //         Some(random, true, finalList)
+    //       } else {
+    //         None
+    //       }
+    //     } else {
+    //       logging.info(this, s"chosenInvoker $chosenInvoker not saturated and found invokers, invokers to to give actions to ${finalList.reverse}, first is primary rest are spread, on step $stepsDone")
+    //       //Some(invokers(chosenInvoker).id, false, finalList.reverse)
+    //       Some(invokers(chosenInvoker).id, false, finalList.reverse)
+    //     }
+    //   } else {
+    //     logging.info(this, s"invoker ${invoker.id} is saturated going to next invoker, on step $stepsDone")
+    //     val newIndex = (index + step) % numInvokers
+    //     ScheduleAndSpread(maxConcurrent, fqn, invokers, dispatched, slots, newIndex, step, homeInvoker, stepsDone + 1, finalList)
+    //   }
+    // }
   }
 }
 
@@ -608,7 +762,7 @@ case class ShardingContainerPoolBalancerConfig(managedFraction: Double,
  *
  * @param id id of the activation
  * @param namespaceId namespace that invoked the action
- * @param invokerName invoker the action is scheduled to
+ * @param invokers number of invokers this action is scheduled to
  * @param memoryLimit memory limit of the invoked action
  * @param timeLimit time limit of the invoked action
  * @param maxConcurrent concurrency limit of the invoked action
@@ -620,7 +774,7 @@ case class ShardingContainerPoolBalancerConfig(managedFraction: Double,
  */
 case class ActivationEntry(id: ActivationId,
                            namespaceId: UUID,
-                           invokerName: InvokerInstanceId,
+                           invokers: Int,
                            memoryLimit: ByteSize,
                            timeLimit: FiniteDuration,
                            maxConcurrent: Int,

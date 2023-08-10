@@ -177,9 +177,22 @@ protected[actions] trait PrimitiveActions {
       case Some(JsObject(fields)) => Some(fields.keySet)
       case _                      => None
     }
+
+
+    var actionName: String = action.fullyQualifiedName(true).name.toString()
+    if (action.fullyQualifiedName(true).name.toString().startsWith("SPREAD_")) {
+      actionName = action.fullyQualifiedName(true).name.toString().substring("SPREAD_".length)
+    }
+
+    logging.info(
+      this,
+      s"Action name inside ActivationMessage is ${EntityName(actionName)}"
+    )
+
+
     val message = ActivationMessage(
       transid,
-      FullyQualifiedEntityName(action.namespace, action.name, Some(action.version), action.binding),
+      FullyQualifiedEntityName(action.namespace, EntityName(actionName), Some(action.version), action.binding),
       action.rev,
       user,
       activationId, // activation id created here

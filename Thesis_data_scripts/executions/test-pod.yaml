@@ -1,0 +1,25 @@
+#apiVersion: v1
+#data:
+#  .dockerconfigjson: eyJhdXRocyI6eyJsb2NhbGhvc3Q6NTAwMCI6eyJ1c2VybmFtZSI6ImhlbnJpcXVlIiwicGFzc3dvcmQiOiJoZW5yaXF1ZSIsImF1dGgiOiJhR1Z1Y21seGRXVTZhR1Z1Y21seGRXVT0ifX19
+#kind: Secret
+#metadata:
+#  creationTimestamp: "2023-07-01T14:04:54Z"
+#  name: hentest1
+#  namespace: default
+#  resourceVersion: "3734"
+#  uid: fbb8a1a7-9382-47ee-9fe2-859878bf0682
+#type: kubernetes.io/dockerconfigjson
+
+#---
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-pod
+#  namespace: default
+spec:
+  containers:
+  - name: test-container
+    image: 192.168.1.10:5000/test-image
+  imagePullSecrets:
+  - name: hentest  # Replace with the actual name of your image pull secret

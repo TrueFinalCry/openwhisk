@@ -1,0 +1,7 @@
+set -x
+
+SCRIPTDIR=$(cd $(dirname "$0") && pwd)
+
+wsk action create sum sum.js -i
+wsk trigger create sum_trigger -i
+wsk rule create sum_rule sum_trigger sum
